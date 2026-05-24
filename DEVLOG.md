@@ -190,15 +190,9 @@ platform_map = {b['TrainNo']: b['Platform']  for b in liveboard}
 **陷阱：** `DailyTrainTimetable/Today/StationNo/{id}` → 404。`GeneralTimetable/StationNo/{id}` → 404。
 正確 OData 路徑：`/v3/Rail/TRA/DailyTrainTimetable/Today` + `$filter=StopTimes/any(s: s/StationID eq '{id}')`
 
-### 跨午夜班次（v0.9）
+### 跨午夜班次（v0.9，已於 v1.0 修正）
 
-晚上 21:00 後，合併隔天班表解決跨午夜查詢（例如 23:30 找 00:30 的班次）：
-```python
-if now.hour >= 21:
-    tomorrow = (now + timedelta(days=1)).strftime('%Y%m%d')
-    tomorrow_tt = await TDX.get_station_timetable_date(from_station, tomorrow)
-    timetables = timetables + tomorrow_tt
-```
+原設計：晚上 21:00 後合併隔天班表。但實測確認 TDX `DailyTrainTimetable/TrainDate/{date}` 回傳 404（僅支援 `Today`），此功能在 v1.0 改以今日班表近似明日。
 
 ### TripPlanner 起始站選擇
 
@@ -255,6 +249,72 @@ GitHub pull 44 commits（`3c69615` → `f95a49f`）：
 
 ---
 
+## v1.0 — 班車查詢除錯 + 明日班次顯示
+
+**日期：** 2026-05-24
+
+### 問題一：站名搜尋 台 vs 臺 字元不符
+
+**症狀：** 輸入「台南」、「台中」等地名，搜尋下拉無建議、目的站無法選取，查詢按鈕永遠 disabled，造成「無班次」假象。
+
+**根因：** TDX 車站 API 回傳名稱為繁體「臺」（臺北、臺南、臺中、臺東），使用者輸入的是常用字「台」，`String.includes()` 嚴格字元比對失敗。
+
+**解法：** `TripPlanner.jsx` 加一行正規化函式，搜尋前將「台」替換為「臺」：
+```js
+const normalize = q => q.replace(/台/g, '臺')
+// filteredDests 改為 s.name.includes(normalize(destQuery))
+```
+
+**影響站名：** 臺北（1000）、臺南（4220）、臺中（3300）、臺東（6000）、臺中港（2210）、臺北-環島（1001）
+
+### 問題二：今日班次已結束，查詢回傳空白無提示
+
+**診斷過程：**
+
+```python
+# 直接呼叫 TDX 確認資料存在
+timetables = await TDX.get_station_timetable_today('1000')
+# → 333 筆，其中 29 班停靠臺南（4220）
+
+# 逐步追蹤 api_trips 過濾結果
+no from_idx: 0
+has from_idx, no to_idx: 304   # 304 班車不經過臺南
+filtered by time window: 29    # 29 班有臺北→臺南，但全在視窗外
+PASSED: 0
+```
+
+**根因：** 測試時間 20:02，臺北→臺南最後一班 19:30（32 分前），3 小時視窗（-5 ~ +180 分）剛好全部落空。班次資料正確，視窗問題。
+
+**TDX 端點限制確認：**
+- `DailyTrainTimetable/TrainDate/{YYYYMMDD}` → **404**（僅支援 Today）
+- `GeneralTimetable`（帶或不帶 filter）→ **404**
+- 可用端點：`DailyTrainTimetable/Today` + OData `$filter=StopTimes/any(s: s/StationID eq '{id}')`
+
+**解法：** 今日無班次且 `hour >= 14` 時，重用今日班表（TRA 日常固定，近似明日），取最早 8 班標記 `nextDay=True`，前端顯示「── 明日最早班次 ──」分隔線。
+
+**後端（main.py）：**
+```python
+def _extract_trips(timetables, from_station, to_station, train_type, trip_line,
+                   now, time_filter=True, ..., next_day=False):
+    # 抽出共用邏輯，time_filter=False 時不限時間視窗
+    ...
+
+# 今日無班次 fallback
+if not result and now.hour >= 14:
+    result = _extract_trips(timetables, ..., time_filter=False, next_day=True)[:8]
+```
+
+**前端（TripPlanner.jsx）：**
+```jsx
+{showDivider && <div className="tp-day-divider">── 明日最早班次 ──</div>}
+{t.nextDay
+  ? <span className="tp-badge tp-next-day">明日</span>
+  : <MinuteBadge depart={t.depart} delay={t.delay} />
+}
+```
+
+---
+
 ## TDX API 欄位備忘
 
 | API | 欄位 | 格式 | 備注 |
@@ -264,6 +324,11 @@ GitHub pull 44 commits（`3c69615` → `f95a49f`）：
 | DailyTrainTimetable StopTimes | `ArrivalTime` / `DepartureTime` | `HH:MM` | 已 5 字，不需截切 |
 | StationLiveBoard | `TripLine` | `0/1/2` | 0=不限, 1=山線, 2=海線 |
 | TrainLiveBoard | `StationID` | 字串 | 無 GPS，需從 stations DB lookup lat/lon |
+
+**已確認 404 的端點（勿使用）：**
+- `DailyTrainTimetable/TrainDate/{YYYYMMDD}` — 僅支援 `/Today`
+- `DailyTrainTimetable/Today/StationNo/{id}` — 用 OData `$filter` 取代
+- `GeneralTimetable`（帶或不帶 filter）— v3 不存在此資源
 
 ---
 
