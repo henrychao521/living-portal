@@ -168,6 +168,93 @@ async def taipei_home():
 
 ---
 
+## v0.8 — 班表精確化 + 景點資訊補強 + 水文 v0.5 整合
+
+**整合日期：** 2026-05-24
+
+### 班車查詢根本修正
+
+**問題：** 臺北→臺中 顯示「此時段無直達班次」，即使明明有班次。
+
+**根因：** `StationLiveBoard` 只回傳目前「在站」或「即將進站」的列車，時間視窗極窄（約 10–30 分鐘）。早上 8:30 查詢，`StationLiveBoard` 僅有 4 筆，3 小時內的班次完全不在內。
+
+**解法：** `/api/trips` 與 `/api/station/types` 改用 `DailyTrainTimetable/Today`（今日完整班表）：
+```python
+# OData filter：取得所有停靠該站的班次
+timetables = await TDX.get_station_timetable_today(from_station)
+# StationLiveBoard 保留，僅用於疊加延誤 / 月台（best-effort）
+delay_map    = {b['TrainNo']: b['DelayTime'] for b in liveboard}
+platform_map = {b['TrainNo']: b['Platform']  for b in liveboard}
+```
+
+**陷阱：** `DailyTrainTimetable/Today/StationNo/{id}` → 404。`GeneralTimetable/StationNo/{id}` → 404。
+正確 OData 路徑：`/v3/Rail/TRA/DailyTrainTimetable/Today` + `$filter=StopTimes/any(s: s/StationID eq '{id}')`
+
+### 跨午夜班次（v0.9）
+
+晚上 21:00 後，合併隔天班表解決跨午夜查詢（例如 23:30 找 00:30 的班次）：
+```python
+if now.hour >= 21:
+    tomorrow = (now + timedelta(days=1)).strftime('%Y%m%d')
+    tomorrow_tt = await TDX.get_station_timetable_date(from_station, tomorrow)
+    timetables = timetables + tomorrow_tt
+```
+
+### TripPlanner 起始站選擇
+
+附近車站晶片從「終點站快選」改為「起始站選擇」：
+- `selectedOrigin` state（預設為點擊的車站）
+- 雙輸入框各有獨立搜尋下拉
+- active 晶片以 `color: #00d4ff` 高亮顯示
+- 車種選單隨起始站改變重新載入
+
+### 景點資訊補強
+
+**問題：** TDX API 對約半數景點的 description 填入字面值「無」。
+
+**解法：**
+1. `tdx.py`：過濾 `{'無', '—', '-', ''}` 描述，改存 `''`；新增 `address`（地址）和 `open_time`（開放時間）欄位
+2. `database.py`：
+   - `tourism_spots` 加 `address`、`open_time`、`wiki_description` 三欄（migration 自動清舊資料）
+   - `upsert_tourism` 改為 UPSERT（`ON CONFLICT DO UPDATE`），保留已補充的 `wiki_description`
+   - `get_tourism_near` 回傳 `description or wiki_description`
+3. `TripPlanner.jsx`：description 空白時 fallback 顯示地址；另一行顯示開放時間
+4. Background task `_wikipedia_enrich()`：每日對空描述景點查 `zh.wikipedia.org/api/rest_v1/page/summary/{name}`，限速 1 req/s
+5. `PREFETCH_CITIES` 補上苗栗（MiaoliCounty）、雲林（YunlinCounty）
+
+**Next.js build 路徑修正（關鍵 bug）：**
+- `BASE_PATH=""` → Next.js 生成 `/_next/...` 絕對路徑
+- Portal 掛 `/hydro/`，瀏覽器找 `/_next/` → 503
+- 修正：`BASE_PATH="/hydro" npm run build` → 生成 `/hydro/_next/...` ✓
+- `start.sh` 早已正確寫 `BASE_PATH=/hydro npm run build`，問題在之前 build 時手動誤用 `BASE_PATH=""`
+
+### scraper 覆蓋率擴大
+
+```python
+# 前：
+for s in stations[:50]:
+    for spot in get_tourism_near(s['lat'], s['lon'], 2000)[:2]:
+# 後：
+for s in stations:            # 全 245 站
+    for spot in get_tourism_near(s['lat'], s['lon'], 2000)[:3]:  # 每站 3 個
+```
+
+### 水文系統 v0.5 整合
+
+GitHub pull 44 commits（`3c69615` → `f95a49f`）：
+
+| 功能 | 說明 |
+|------|------|
+| 全台水文分區 | 全台 / 北台灣 / 中部 / 中南部 / 南部 / 東部 / 離島 |
+| 水位站擴充 | 91 站全台即時水位 |
+| 水庫擴充 | 8 座水庫（石岡壩 / 德基 / 日月潭等） |
+| AQI | 右側面板即時空氣品質，含 PM2.5 |
+| CCTV 擴充 | 全台水利署監控鏡頭，點擊 popup 顯示即時影像 |
+| 圖層切換 | Header 雨量 / 水位 / 水庫 / AQI / 鏡頭 各自開關 |
+| 輪詢頻率 | 5 分鐘 → 1 分鐘 |
+
+---
+
 ## TDX API 欄位備忘
 
 | API | 欄位 | 格式 | 備注 |
