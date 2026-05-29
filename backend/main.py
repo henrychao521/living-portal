@@ -1,8 +1,12 @@
 import asyncio
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent.parent / '.env')
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -14,6 +18,7 @@ from starlette.responses import Response
 import tdx as TDX
 import twipcam
 import weather as WX
+import alerts as ALERTS
 from database import (
     init_db, get_social,
     get_stations_age, upsert_stations, get_all_stations,
@@ -47,6 +52,7 @@ async def startup():
     init_db()
     asyncio.create_task(_prefetch_static())
     asyncio.create_task(_deferred_scraper())
+    asyncio.create_task(ALERTS.alert_loop())
 
 
 async def _prefetch_static():
@@ -465,6 +471,13 @@ async def api_weather(lat: float = Query(...), lon: float = Query(...)):
     return await WX.get_weather_near(lat, lon)
 
 
+# ── Alerts ────────────────────────────────────────────────────────────────────
+
+@app.get('/api/alerts')
+async def api_alerts():
+    return ALERTS.get_alerts()
+
+
 # ── Social Content ────────────────────────────────────────────────────────────
 
 @app.get('/api/social/{attraction}')
@@ -492,12 +505,15 @@ PORTAL_HTML = """<!DOCTYPE html>
 <title>即時監控中心</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#05080f;font-family:'Courier New',Consolas,monospace;overflow:hidden}
+html,body{height:100%}
+body{
+  background:#05080f;font-family:'Courier New',Consolas,monospace;
+  overflow:hidden;display:flex;flex-direction:column;
+}
 #nav{
-  height:38px;background:#080d1a;
+  flex:0 0 38px;background:#080d1a;
   border-bottom:1px solid #142840;
   display:flex;align-items:center;padding:0 10px;gap:4px;
-  position:relative;
 }
 .tab{
   padding:0 14px;height:26px;border:1px solid #142840;border-radius:3px;
@@ -511,7 +527,27 @@ body{background:#05080f;font-family:'Courier New',Consolas,monospace;overflow:hi
   margin-left:auto;font-size:9px;color:#1e3050;
   letter-spacing:2px;text-transform:uppercase;
 }
-#frames{width:100vw;height:calc(100vh - 38px);position:relative}
+/* ── Alert bar ── */
+#alert-bar{
+  flex:0 0 auto;background:#060b16;
+  border-bottom:1px solid #142840;
+  overflow:hidden;
+}
+#alert-bar:empty{border-bottom:none}
+.alert-row{
+  display:flex;align-items:center;gap:10px;
+  padding:4px 12px;font-size:11px;letter-spacing:.3px;
+  border-bottom:1px solid rgba(255,255,255,.04);
+}
+.alert-row:last-child{border-bottom:none}
+.alert-row.red   {border-left:3px solid #ff2040;color:#ff6070}
+.alert-row.orange{border-left:3px solid #ff7800;color:#ffaa40}
+.alert-row.yellow{border-left:3px solid #ccaa00;color:#ffd700}
+.alert-tag{font-weight:bold;white-space:nowrap;min-width:72px}
+.alert-msg{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.alert-time{color:#304060;font-size:10px;white-space:nowrap}
+/* ── iframes ── */
+#frames{flex:1;position:relative;overflow:hidden}
 iframe{
   position:absolute;inset:0;width:100%;height:100%;
   border:none;opacity:0;pointer-events:none;transition:opacity .2s;
@@ -526,6 +562,7 @@ iframe.active{opacity:1;pointer-events:auto}
   <button class="tab" onclick="show('rail',this)">🚂 台鐵即時</button>
   <span id="logo">即時監控中心 · LIVE DASHBOARD</span>
 </nav>
+<div id="alert-bar"></div>
 <div id="frames">
   <iframe id="hydro" src="/hydro/" class="active"></iframe>
   <iframe id="taipei" src="/taipei/"></iframe>
@@ -538,6 +575,26 @@ function show(id,btn){
   document.getElementById(id).classList.add('active');
   btn.classList.add('active');
 }
+
+const EMOJI = {red:'🔴',orange:'🟠',yellow:'🟡'};
+
+async function refreshAlerts(){
+  try{
+    const alerts = await fetch('/api/alerts').then(r=>r.json());
+    const bar = document.getElementById('alert-bar');
+    bar.innerHTML = alerts.map(a=>
+      `<div class="alert-row ${a.level}" title="${a.detail||''}">
+        <span>${EMOJI[a.level]||'⚪'}</span>
+        <span class="alert-tag">${a.type}</span>
+        <span class="alert-msg">${a.summary}</span>
+        <span class="alert-time">更新 ${a.updated_at}</span>
+      </div>`
+    ).join('');
+  }catch(e){console.warn('[alerts]',e)}
+}
+
+refreshAlerts();
+setInterval(refreshAlerts, 60000);
 </script>
 </body>
 </html>"""
