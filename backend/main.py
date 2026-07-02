@@ -644,8 +644,15 @@ async def taipei_api(path: str, request: Request):
 
 # ── Frontend（必須最後 mount）────────────────────────────────────────────────
 
-FRONTEND_DIST = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
-HYDRO_DIST    = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'Projects', 'hydro-monitor', 'out')
+_b = os.path.dirname(__file__)
+# Mac 原始路徑 vs Pi 扁平布局，自動偵測
+_fe1 = os.path.join(_b, '..', 'frontend', 'frontend', 'dist')   # Mac: living-portal/frontend/frontend/dist
+_fe2 = os.path.join(_b, '..', 'frontend')                        # Pi:  living-portal/frontend/
+FRONTEND_DIST = _fe1 if os.path.isdir(_fe1) else _fe2
+
+_hy1 = os.path.join(_b, '..', '..', 'hydro-monitor', 'out')     # Mac: ~/Projects/hydro-monitor/out
+_hy2 = os.path.join(_b, '..', 'hydro')                           # Pi:  living-portal/hydro/
+HYDRO_DIST = _hy1 if os.path.isdir(_hy1) else _hy2
 
 _MIME = {'.js': 'application/javascript', '.css': 'text/css', '.html': 'text/html'}
 
