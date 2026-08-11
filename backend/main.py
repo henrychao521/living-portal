@@ -20,6 +20,7 @@ import twipcam
 import weather as WX
 import alerts as ALERTS
 from database import (
+    get_tourism_spots_missing_desc, bulk_update_wiki_descriptions,
     init_db, get_social,
     get_stations_age, upsert_stations, get_all_stations,
     get_tourism_age, upsert_tourism, get_tourism_near,
@@ -42,6 +43,7 @@ PREFETCH_CITIES = [
     'Tainan', 'Kaohsiung', 'Hsinchu', 'Keelung',
     'HualienCounty', 'TaitungCounty', 'YilanCounty',
     'PingtungCounty', 'Chiayi', 'Changhua',
+    'MiaoliCounty', 'YunlinCounty',
 ]
 
 
@@ -55,6 +57,7 @@ async def startup():
     if os.environ.get('RUN_BACKGROUND', '1') == '1':
         asyncio.create_task(_prefetch_static())
         asyncio.create_task(_deferred_scraper())
+        asyncio.create_task(_wikipedia_enrich())
         asyncio.create_task(ALERTS.alert_loop())
     else:
         print('[startup] RUN_BACKGROUND=0,本 instance 不執行背景任務')
@@ -141,8 +144,8 @@ async def _deferred_scraper():
         from database import get_tourism_near
         seen = set()
         names = []
-        for s in stations[:50]:
-            for spot in get_tourism_near(s['lat'], s['lon'], 2000)[:2]:
+        for s in stations:          # 全站（原本 [:50]）
+            for spot in get_tourism_near(s['lat'], s['lon'], 2000)[:3]:  # 每站 3 個
                 if spot['name'] not in seen:
                     seen.add(spot['name'])
                     names.append(spot['name'])
@@ -155,6 +158,27 @@ async def _deferred_scraper():
 
 
 # ── Train LiveBoard ───────────────────────────────────────────────────────────
+
+async def _wikipedia_enrich():
+    """為空描述景點補充 Wikipedia 摘要，限速 1 req/s，每日 startup 執行一次。"""
+    await asyncio.sleep(180)  # 等 prefetch 完成後再跑
+    while True:
+        spots = get_tourism_spots_missing_desc(limit=300)
+        if not spots:
+            print('[wiki] 無需補充，全部景點已有描述')
+        else:
+            print(f'[wiki] 開始補充 {len(spots)} 個景點...')
+            updates = []
+            for spot in spots:
+                desc = await TDX.get_wiki_summary(spot['name'])
+                if desc:
+                    updates.append((spot['id'], desc))
+                await asyncio.sleep(1)
+            if updates:
+                bulk_update_wiki_descriptions(updates)
+                print(f'[wiki] 補充完成：{len(updates)}/{len(spots)} 個有結果')
+        await asyncio.sleep(86400)  # 每日重跑
+
 
 @app.get('/api/trains')
 async def api_trains():
@@ -321,75 +345,61 @@ async def api_train_route(train_no: str, from_station: str = Query('')):
 
 @app.get('/api/station/{station_id}/types')
 async def api_station_types(station_id: str):
-    boards = await TDX.get_station_liveboard(station_id)
+    """今日可搭車種（用 DailyTimetable，不受即時板視窗限制）。"""
+    timetables = await TDX.get_station_timetable_today(station_id)
     now = datetime.now()
     types_seen: dict = {}
-    for b in boards:
-        depart_str = b.get('ScheduleDepartureTime') or b.get('ScheduleArrivalTime')
-        if not depart_str:
-            continue
-        h, m = map(int, depart_str.split(':')[:2])
-        delta = (h * 60 + m) - (now.hour * 60 + now.minute)
-        if delta < -720:
-            delta += 1440
-        if not (-5 <= delta <= 120):
-            continue
-        type_name = b.get('TrainTypeName', {}).get('Zh_tw', '')
-        trip_line = b.get('TripLine', 0)
+    for tt in timetables:
+        info = tt.get('TrainInfo', {})
+        type_name = (info.get('TrainTypeName') or {}).get('Zh_tw', '') or info.get('TrainTypeID', '')
+        trip_line = info.get('TripLine', 0)
         if not type_name:
             continue
-        if type_name not in types_seen:
-            types_seen[type_name] = {'name': type_name, 'hasTripLine': False}
-        if trip_line in (1, 2):
-            types_seen[type_name]['hasTripLine'] = True
+        # 找出此站的發車時間，限 3 小時內
+        for s in tt.get('StopTimes', []):
+            if s.get('StationID') != station_id:
+                continue
+            dep = s.get('DepartureTime') or s.get('ArrivalTime') or ''
+            if not dep:
+                break
+            try:
+                h, m = map(int, dep.split(':')[:2])
+                delta = (h * 60 + m) - (now.hour * 60 + now.minute)
+                if delta < -720:
+                    delta += 1440
+                if not (-5 <= delta <= 180):
+                    break
+            except Exception:
+                break
+            if type_name not in types_seen:
+                types_seen[type_name] = {'name': type_name, 'hasTripLine': False}
+            if trip_line in (1, 2):
+                types_seen[type_name]['hasTripLine'] = True
+            break
     return list(types_seen.values())
 
 
 # ── Trip search A → B ────────────────────────────────────────────────────────
 
-@app.get('/api/trips')
-async def api_trips(
-    from_station: str = Query(...),
-    to_station: str = Query(...),
-    train_type: str = Query(''),
-    trip_line: Optional[int] = Query(None),
-):
-    boards = await TDX.get_station_liveboard(from_station)
-    now = datetime.now()
-    candidates = []
-    for b in boards:
-        type_name = b.get('TrainTypeName', {}).get('Zh_tw', '')
+def _extract_trips(timetables, from_station, to_station, train_type, trip_line,
+                   now, time_filter=True, delay_map=None, platform_map=None, next_day=False):
+    """從班表清單中找出 from→to 的班次。time_filter=False 時不限時間視窗（明日班次用）。"""
+    delay_map    = delay_map    or {}
+    platform_map = platform_map or {}
+    result = []
+    for tt in timetables:
+        train_info = tt.get('TrainInfo', {})
+        train_no   = train_info.get('TrainNo', '')
+        type_name  = (train_info.get('TrainTypeName') or {}).get('Zh_tw', '') or \
+                     train_info.get('TrainTypeID', '')
+        tl         = train_info.get('TripLine', 0)
+
         if train_type and train_type != type_name:
             continue
-        if trip_line and b.get('TripLine', 0) not in (0, trip_line):
+        if trip_line and tl not in (0, trip_line):
             continue
-        depart_str = b.get('ScheduleDepartureTime') or b.get('ScheduleArrivalTime')
-        if not depart_str:
-            continue
-        h, m = map(int, depart_str.split(':')[:2])
-        delta = (h * 60 + m) - (now.hour * 60 + now.minute)
-        if delta < -720:
-            delta += 1440
-        if not (-5 <= delta <= 120):
-            continue
-        candidates.append(b)
 
-    sem = asyncio.Semaphore(3)
-
-    async def _fetch(train_no):
-        async with sem:
-            return await TDX.get_daily_timetable(train_no)
-
-    timetables = await asyncio.gather(
-        *[_fetch(b.get('TrainNo')) for b in candidates],
-        return_exceptions=True,
-    )
-
-    result = []
-    for b, timetable in zip(candidates, timetables):
-        if isinstance(timetable, Exception):
-            continue
-        stops = timetable.get('StopTimes', [])
+        stops = tt.get('StopTimes', [])
         from_idx = to_idx = None
         for i, s in enumerate(stops):
             if s.get('StationID') == from_station and from_idx is None:
@@ -402,6 +412,21 @@ async def api_trips(
 
         dep = (stops[from_idx].get('DepartureTime') or stops[from_idx].get('ArrivalTime') or '')[:5]
         arr = (stops[to_idx].get('ArrivalTime') or stops[to_idx].get('DepartureTime') or '')[:5]
+        if not dep:
+            continue
+
+        if time_filter:
+            # 時間視窗：-5 分 ~ +180 分（3 小時內發車）
+            try:
+                h, m = map(int, dep.split(':'))
+                delta = (h * 60 + m) - (now.hour * 60 + now.minute)
+                if delta < -720:
+                    delta += 1440
+                if not (-5 <= delta <= 180):
+                    continue
+            except Exception:
+                continue
+
         try:
             d_h, d_m = map(int, dep.split(':'))
             a_h, a_m = map(int, arr.split(':'))
@@ -411,29 +436,61 @@ async def api_trips(
         except Exception:
             journey_min = 0
 
-        route_stops = []
-        for s in stops[from_idx:to_idx + 1]:
-            route_stops.append({
-                'stationId': s.get('StationID'),
+        route_stops = [
+            {
+                'stationId':   s.get('StationID'),
                 'stationName': s.get('StationName', {}).get('Zh_tw', ''),
-                'arrival': (s.get('ArrivalTime') or '')[:5],
-                'departure': (s.get('DepartureTime') or '')[:5],
-            })
+                'arrival':     (s.get('ArrivalTime')   or '')[:5],
+                'departure':   (s.get('DepartureTime') or '')[:5],
+            }
+            for s in stops[from_idx:to_idx + 1]
+        ]
 
         result.append({
-            'trainNo': b.get('TrainNo'),
-            'trainType': b.get('TrainTypeName', {}).get('Zh_tw', ''),
-            'direction': b.get('Direction'),
-            'depart': dep,
-            'arrive': arr,
+            'trainNo':    train_no,
+            'trainType':  type_name,
+            'tripLine':   tl,
+            'depart':     dep,
+            'arrive':     arr,
             'journeyMin': journey_min,
-            'platform': b.get('Platform', ''),
-            'delay': b.get('DelayTime', 0),
-            'tripLine': b.get('TripLine', 0),
-            'stops': route_stops,
+            'platform':   platform_map.get(train_no, ''),
+            'delay':      delay_map.get(train_no, 0),
+            'stops':      route_stops,
+            'nextDay':    next_day,
         })
 
     result.sort(key=lambda x: x['depart'])
+    return result
+
+
+@app.get('/api/trips')
+async def api_trips(
+    from_station: str = Query(...),
+    to_station: str = Query(...),
+    train_type: str = Query(''),
+    trip_line: Optional[int] = Query(None),
+):
+    now = datetime.now()
+    # TDX v3 只支援 DailyTrainTimetable/Today，TrainDate/{date} 回傳 404
+    timetables = await TDX.get_station_timetable_today(from_station)
+
+    # 即時板疊加延誤/月台（best-effort，不影響班表查詢）
+    try:
+        liveboard = await TDX.get_station_liveboard(from_station)
+        delay_map    = {b.get('TrainNo'): b.get('DelayTime', 0) for b in liveboard}
+        platform_map = {b.get('TrainNo'): b.get('Platform', '')  for b in liveboard}
+    except Exception:
+        delay_map, platform_map = {}, {}
+
+    result = _extract_trips(timetables, from_station, to_station, train_type, trip_line,
+                            now, time_filter=True, delay_map=delay_map, platform_map=platform_map)
+
+    # 今日無班次 → 用今日班表近似明日（TRA 班表日常固定），取最早 8 班
+    # 下午 2 點後生效，避免早晨誤觸
+    if not result and now.hour >= 14:
+        result = _extract_trips(timetables, from_station, to_station, train_type, trip_line,
+                                now, time_filter=False, next_day=True)[:8]
+
     return result
 
 
