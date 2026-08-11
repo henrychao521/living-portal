@@ -20,7 +20,7 @@ echo "      Done → hydro-monitor/out/"
 # ── Start backend ─────────────────────────────────────────────────────────────
 echo "[3/4] Starting backend on :8443 (HTTPS / Tailscale)..."
 cd "$SCRIPT_DIR/backend"
-/opt/homebrew/bin/python3 -m hypercorn main:app \
+RUN_BACKGROUND=0 /opt/homebrew/bin/python3 -m hypercorn main:app \
   --bind 0.0.0.0:8443 \
   --keyfile "$KEY" \
   --certfile "$CERT" \

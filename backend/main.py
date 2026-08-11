@@ -50,9 +50,14 @@ PREFETCH_CITIES = [
 @app.on_event('startup')
 async def startup():
     init_db()
-    asyncio.create_task(_prefetch_static())
-    asyncio.create_task(_deferred_scraper())
-    asyncio.create_task(ALERTS.alert_loop())
+    # 背景任務只在其中一個 instance 跑(start.sh 起兩個 hypercorn 共用同一份程式,
+    # 兩份都跑會重複發 Telegram 警報、CWA/TDX 額度加倍、併寫 sqlite)
+    if os.environ.get('RUN_BACKGROUND', '1') == '1':
+        asyncio.create_task(_prefetch_static())
+        asyncio.create_task(_deferred_scraper())
+        asyncio.create_task(ALERTS.alert_loop())
+    else:
+        print('[startup] RUN_BACKGROUND=0,本 instance 不執行背景任務')
 
 
 async def _prefetch_static():

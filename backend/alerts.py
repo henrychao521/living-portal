@@ -8,8 +8,9 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
 import httpx
+import hashlib
 
-CWA_KEY  = os.environ.get('CWA_API_KEY', 'CWA-21F97E17-4D76-4B64-91FC-67B637C2DFBE')
+CWA_KEY  = os.environ.get('CWA_API_KEY', '')  # 金鑰一律走 .env,絕不進 repo(2026-08 已因外洩換發)
 CWA_BASE = 'https://opendata.cwa.gov.tw/api/v1/rest/datastore'
 
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_BOT_TOKEN', '')
@@ -120,7 +121,7 @@ async def _fetch_special():
                 area_names = '、'.join(a.get('locationName', '') for a in areas[:6])
                 phenomena = hz.get('info', {}).get('phenomena', rec.get('datasetDescription', '特報'))
                 raw_id = phenomena + area_names + rec.get('issueTime', '')
-                aid = f'special-{abs(hash(raw_id)) % 0xFFFFFF:06x}'
+                aid = f'special-{hashlib.md5(raw_id.encode()).hexdigest()[:6]}'
                 keep.add(aid)
                 level = 'red' if any(k in phenomena for k in ('豪雨', '大豪雨', '颱風')) else 'orange'
                 await _upsert(Alert(id=aid, level=level, type=phenomena,
@@ -142,7 +143,7 @@ async def _fetch_flood():
             title = item.findtext('title') or ''
             if not any(k in title for k in ('淹水', '警戒', '水位')):
                 continue
-            aid = f'flood-{abs(hash(title)) % 0xFFFFFF:06x}'
+            aid = f'flood-{hashlib.md5(title.encode()).hexdigest()[:6]}'
             keep.add(aid)
             await _upsert(Alert(id=aid, level='orange', type='淹水警戒',
                                 summary=title, detail='', updated_at=_now()))

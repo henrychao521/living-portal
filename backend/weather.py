@@ -60,7 +60,10 @@ async def get_weather_near(lat: float, lon: float) -> dict:
                 'weather_desc': obs.get('Weather') or None,
             }
     except Exception as e:
-        result = {'error': str(e)}
+        print(f'[weather] fetch 失敗: {e}')
+        result = {'error': '氣象資料暫時無法取得'}
+        _wx_cache[key] = (now + 60, result)  # 錯誤只快取 1 分鐘,讓上游恢復後儘快重試
+        return result
 
     _wx_cache[key] = (now + 600, result)
     return result
