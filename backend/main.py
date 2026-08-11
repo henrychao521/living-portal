@@ -544,14 +544,19 @@ async def api_alerts():
 
 @app.get('/api/social/{attraction}')
 async def api_social(attraction: str):
-    return get_social(attraction)
+    rows = get_social(attraction)
+    # DB 可能存絕對路徑;對外只露檔名,由 /screenshots/{fname} 服務
+    for r in rows:
+        if r.get('screenshot'):
+            r['screenshot'] = '/screenshots/' + os.path.basename(r['screenshot'])
+    return rows
 
 
 # ── Screenshot static files ───────────────────────────────────────────────────
 
 @app.get('/screenshots/{filename}')
 async def serve_screenshot(filename: str):
-    fpath = os.path.join(SCREENSHOT_DIR, filename)
+    fpath = os.path.join(SCREENSHOT_DIR, os.path.basename(filename))
     if not os.path.exists(fpath):
         raise HTTPException(404, 'screenshot not found')
     return FileResponse(fpath, media_type='image/jpeg')

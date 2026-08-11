@@ -158,18 +158,20 @@ async def _fetch_quake():
     try:
         async with httpx.AsyncClient(verify=False) as c:
             r = await c.get(f'{CWA_BASE}/E-A0015-001',
-                            params={'Authorization': CWA_KEY, 'format': 'JSON', 'limit': '1'},
+                            params={'Authorization': CWA_KEY, 'format': 'JSON', 'limit': '10'},
                             timeout=15)
         quakes = r.json().get('records', {}).get('Earthquake', [])
-        if not quakes:
+        # 取近 10 筆中規模最大且仍在時窗內者——limit=1 時最新一筆小震會清掉先前大震警報
+        q = None
+        for cand in quakes:
+            m = float(cand.get('EarthquakeInfo', {}).get('EarthquakeMagnitude', {}).get('MagnitudeValue', 0))
+            if m >= 4.0 and (q is None or m > float(q.get('EarthquakeInfo', {}).get('EarthquakeMagnitude', {}).get('MagnitudeValue', 0))):
+                q = cand
+        if q is None:
             await _clear_stale(set(), 'quake-')
             return
-        q = quakes[0]
         info = q.get('EarthquakeInfo', {})
         mag = float(info.get('EarthquakeMagnitude', {}).get('MagnitudeValue', 0))
-        if mag < 4.0:
-            await _clear_stale(set(), 'quake-')
-            return
         # 超過 30 分鐘不再顯示
         origin_str = info.get('OriginTime', '')
         try:
