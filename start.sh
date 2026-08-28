@@ -3,7 +3,7 @@ set -e
 
 CERT=/Users/henry/Desktop/claude/henrymac-studio.tail2562dd.ts.net.crt
 KEY=/Users/henry/Desktop/claude/henrymac-studio.tail2562dd.ts.net.key
-HYDRO_DIR="/Volumes/128G/hydro-monitor"
+HYDRO_DIR="/Volumes/Work/hydro-monitor"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── Build frontends ───────────────────────────────────────────────────────────
